@@ -81,7 +81,7 @@ class ReconciliationEngine:
         
         # Normalizar fechas para banco
         if 'Fecha' in df.columns:
-            df['Fecha_Banco'] = pd.to_datetime(df['Fecha'], errors='coerce')
+            df['Fecha_Banco'] = pd.to_datetime(df['Fecha'], errors='coerce').dt.normalize()
         
         # Para archivos Scotia, el documento está en 'Comprobante'
         if 'Comprobante' in df.columns and 'Número de documento' not in df.columns:
@@ -127,14 +127,14 @@ class ReconciliationEngine:
         
         # Normalizar fechas según el workflow
         if self.workflow_type == 'workflow_2' and 'fec' in df.columns:
-            df['Fecha_Sistema'] = pd.to_datetime(df['fec'], errors='coerce')
+            df['Fecha_Sistema'] = pd.to_datetime(df['fec'], errors='coerce').dt.normalize()
         elif self.workflow_type == 'workflow_1' and 'Fecha' in df.columns:
             # Para Workflow 1 (cuentas 4103, 4355, 10377): usar columna 'Fecha'
-            df['Fecha_Sistema'] = pd.to_datetime(df['Fecha'], errors='coerce')
+            df['Fecha_Sistema'] = pd.to_datetime(df['Fecha'], errors='coerce').dt.normalize()
         elif 'Fecha' in df.columns:
-            df['Fecha_Sistema'] = pd.to_datetime(df['Fecha'], errors='coerce')
+            df['Fecha_Sistema'] = pd.to_datetime(df['Fecha'], errors='coerce').dt.normalize()
         elif 'fec' in df.columns:
-            df['Fecha_Sistema'] = pd.to_datetime(df['fec'], errors='coerce')
+            df['Fecha_Sistema'] = pd.to_datetime(df['fec'], errors='coerce').dt.normalize()
         
         df['Matched'] = False
         df['Match_ID'] = None
@@ -201,9 +201,9 @@ class ReconciliationEngine:
         print(f"   Muestra Fecha_sistema: {merged['Fecha_sistema'].head(3).tolist()}")
         print(f"   Muestra Fecha_banco: {merged['Fecha_banco'].head(3).tolist()}")
         
-        # Procesar fechas con más opciones de formato
-        merged['Fecha_sistema'] = pd.to_datetime(merged['Fecha_sistema'], format='mixed', errors='coerce')
-        merged['Fecha_banco'] = pd.to_datetime(merged['Fecha_banco'], format='mixed', errors='coerce')
+        # Procesar fechas con más opciones de formato y normalizar
+        merged['Fecha_sistema'] = pd.to_datetime(merged['Fecha_sistema'], format='mixed', errors='coerce').dt.normalize()
+        merged['Fecha_banco'] = pd.to_datetime(merged['Fecha_banco'], format='mixed', errors='coerce').dt.normalize()
         
         # Verificar conversión exitosa
         fecha_sistema_nulas = merged['Fecha_sistema'].isna().sum()
@@ -219,6 +219,7 @@ class ReconciliationEngine:
                 merged['Fecha_banco'] = pd.to_datetime(merged['Fecha_banco'], dayfirst=True, errors='coerce')
         
         # Calcular diferencias solo si las fechas son válidas
+        # CORRECCIÓN: dif_dias debe ser positivo cuando fecha_sistema > fecha_banco
         merged['dif_dias'] = (merged['Fecha_sistema'] - merged['Fecha_banco']).dt.days
         
         # Calcular diferencia de montos
@@ -230,74 +231,74 @@ class ReconciliationEngine:
         valid_diffs = merged['dif_dias'].notna()
         print(f"   Diferencias válidas: {valid_diffs.sum()} de {len(merged)}")
         if valid_diffs.any():
-            in_range = ((merged['dif_dias'] >= -3) & (merged['dif_dias'] <= 3) & valid_diffs).sum()
-            print(f"   Registros con dif -3 a +3: {in_range}")
+            in_range = ((merged['dif_dias'] >= 0) & (merged['dif_dias'] <= self.tolerance_days) & valid_diffs).sum()
+            print(f"   Registros con dif 0 a +{self.tolerance_days}: {in_range}")
         
-        # MEJORAS EN VALIDACIÓN Y CALIDAD
-        # 1. Aplicar tolerancia múltiple: exacto, cercano, documento
+        # CORRECCIÓN CRÍTICA: SOLO verificar transacciones que cumplan AMBAS condiciones
         merged['verificada'] = ''
         merged['match_quality'] = ''
         
-        # Match exacto (prioridad 1): fecha y monto exactos
-        exact_match = (
-            (merged['dif_dias'] == 0) & 
-            merged['dif_dias'].notna() & 
-            (merged['monto_dif'].abs() <= 0.01)
+        # ÚNICA CONDICIÓN DE VERIFICACIÓN: fecha sistema dentro de tolerancia DESPUÉS de fecha banco + montos enteros iguales
+        print(f"🔍 DEBUG - Aplicando tolerancia: fecha sistema debe estar 0 a +{self.tolerance_days} días después de fecha banco")
+        print(f"🔍 DEBUG - Comparando solo la parte entera de los montos (sin decimales)")
+        
+        # Convertir montos a enteros para comparación (sin decimales)
+        merged['Monto_entero'] = merged['Monto'].fillna(0).astype(float).astype(int)
+        merged['Monto_Neto_entero'] = merged['Monto_Neto'].fillna(0).astype(float).astype(int)
+        
+        verificacion_estricta = (
+            (merged['dif_dias'] >= 0) &  # Fecha sistema igual o posterior a fecha banco
+            (merged['dif_dias'] <= self.tolerance_days) &  # Fecha sistema dentro de tolerancia
+            merged['dif_dias'].notna() &  # Solo fechas válidas
+            (merged['Monto_entero'] == merged['Monto_Neto_entero'])  # Montos enteros iguales
         )
-        merged.loc[exact_match, 'verificada'] = 'v'
+        merged.loc[verificacion_estricta, 'verificada'] = 'v'
+        
+        # Clasificar calidad del match para las verificadas
+        # Match exacto: fecha exacta
+        exact_match = verificacion_estricta & (merged['dif_dias'] == 0)
         merged.loc[exact_match, 'match_quality'] = 'exacto'
         
-        # Match por tolerancia (prioridad 2): dentro de tolerancia de días, monto exacto
-        tolerance_match = (
-            (merged['dif_dias'].abs() <= self.tolerance_days) & 
-            merged['dif_dias'].notna() & 
-            (merged['monto_dif'].abs() <= 0.01) &
-            (merged['verificada'] == '')  # Solo si no hay match exacto
-        )
-        merged.loc[tolerance_match, 'verificada'] = 'v'
+        # Match por tolerancia: dentro de rango pero no exacto
+        tolerance_match = verificacion_estricta & (merged['dif_dias'] != 0)
         merged.loc[tolerance_match, 'match_quality'] = 'tolerancia_fecha'
         
-        # Match por documento (prioridad 3): número de documento coincide
-        # Para Workflow 1, usar los últimos 3 dígitos del número de documento
-        doc_match = merged['verificada'] == ''
-        if doc_match.any():
-            # Convertir números de documento a string y tomar últimos 3 dígitos
-            merged['doc_banco_tail'] = merged['Número de documento'].astype(str).str[-3:]
-            merged['doc_sistema_tail'] = merged['Nro.Ref.Bco'].astype(str).str[-3:]
-            
-            document_match = (
-                (merged['doc_banco_tail'] == merged['doc_sistema_tail']) &
-                (merged['doc_banco_tail'].str.len() >= 3) &  # Validar que tenga al menos 3 dígitos
-                (merged['verificada'] == '')
-            )
-            merged.loc[document_match, 'verificada'] = 'v'
-            merged.loc[document_match, 'match_quality'] = 'documento'
-        
-        # VALIDACIÓN ADICIONAL: revisar duplicados y conflicts
-        # Identificar si hay múltiples matches para la misma transacción
+        # VALIDACIÓN ADICIONAL: revisar duplicados
         duplicated_banco = merged['Número de documento'].duplicated(keep=False)
         duplicated_sistema = merged['Nro.Ref.Bco'].duplicated(keep=False)
         
         if duplicated_banco.any() or duplicated_sistema.any():
             print(f"⚠️ Advertencia: {duplicated_banco.sum()} duplicados banco, {duplicated_sistema.sum()} duplicados sistema")
         
-        condition = (
-            (merged['dif_dias'] >= -3) &  
-            (merged['dif_dias'] <= 3) &
-            merged['dif_dias'].notna()  # Solo fechas válidas
-        )
-        merged.loc[condition, 'verificada'] = 'v'
-        
         # Filtrar solo las verificadas
         verificadas = merged[merged['verificada'] == 'v'].copy()
         verificadas.reset_index(drop=True, inplace=True)
         
+        print(f"🔍 DEBUG - Análisis de verificación:")
+        print(f"   Total registros después del merge: {len(merged)}")
+        print(f"   Registros marcados como verificados: {len(verificadas)}")
+        if len(verificadas) > 0:
+            print(f"   Muestra diferencias de días: {verificadas['dif_dias'].head(3).tolist()}")
+            print(f"   Muestra montos banco (decimales): {verificadas['Monto_Neto'].head(3).tolist()}")
+            print(f"   Muestra montos sistema (decimales): {verificadas['Monto'].head(3).tolist()}")
+            print(f"   Muestra montos banco (enteros): {verificadas['Monto_Neto_entero'].head(3).tolist()}")
+            print(f"   Muestra montos sistema (enteros): {verificadas['Monto_entero'].head(3).tolist()}")
+            print(f"   Muestra fechas banco: {verificadas['Fecha_banco'].head(3).tolist()}")
+            print(f"   Muestra fechas sistema: {verificadas['Fecha_sistema'].head(3).tolist()}")
+            # Verificar si hay diferencias de días fuera del rango
+            dif_fuera_rango = verificadas[(verificadas['dif_dias'] < 0) | (verificadas['dif_dias'] > self.tolerance_days)]
+            if len(dif_fuera_rango) > 0:
+                print(f"   ⚠️ PROBLEMA: {len(dif_fuera_rango)} registros verificados con fechas fuera del rango 0 a +{self.tolerance_days}")
+                print(f"      Diferencias problemáticas: {dif_fuera_rango['dif_dias'].head(5).tolist()}")
+            else:
+                print(f"   ✅ Todas las verificadas cumplen: fechas 0 a +{self.tolerance_days} días Y montos enteros iguales")
+        
         if verificadas.empty:
-            print("⚠️ No se encontraron registros dentro de la tolerancia de fechas")
+            print("⚠️ No se encontraron registros dentro de la tolerancia de fechas Y montos exactos")
             return pd.DataFrame(), banco_df, sistema_df
         
         # Limpiar columnas temporales
-        verificadas = verificadas.drop(columns=['tail', 'dif_dias'], errors='ignore')
+        verificadas = verificadas.drop(columns=['tail', 'dif_dias', 'Monto_entero', 'Monto_Neto_entero'], errors='ignore')
         
         # Deduplicar por ID_sistema e ID_banco como en tu notebook
         verificadas = verificadas.drop_duplicates(subset='ID_sistema', keep='first')
